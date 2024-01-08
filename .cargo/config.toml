@@ -3,7 +3,7 @@ rustflags = [
 	"-C", "link-args=-s", "-C", "link-args=USE_SDL=2",
 	"-C", "link-args=-s", "-C", "link-args=USE_WEBGL2=1",
 	"-C", "link-args=-s", "-C", "link-args=FULL_ES3=1",
-	"-C", "link-args=--preload-file file.txt",
+	"-C", "link-args=--preload-file assets",
 	"-C", "link-args=-s", "-C", "link-args=MAXIMUM_MEMORY=4GB",
 	"-C", "link-args=-s", "-C", "link-args=ALLOW_MEMORY_GROWTH=1",
 ]
