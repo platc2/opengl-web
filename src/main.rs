@@ -1,20 +1,50 @@
+extern crate anyhow;
 extern crate sdl2;
 
+#[cfg(target_os = "emscripten")]
 use std::ffi::CStr;
-use std::io::Read;
+use std::path::Path;
+
+use anyhow::Result;
+use sdl2::mouse::MouseButton;
 use sdl2::video::GLProfile;
+
+use crate::key_codes::KeyCodes;
+use crate::mouse_buttons::MouseButtons;
+use crate::program::Program;
+use crate::shader::{Kind, Shader};
+
+mod gl {
+    pub use gl::buffer::*;
+    pub use gl::load_with;
+    pub use gl::program::*;
+    pub use gl::rendering::*;
+    pub use gl::state::*;
+    pub use gl::sys;
+    pub use gl::vertex_array::*;
+    pub use gl::vertex_attrib::*;
+}
 
 #[cfg(target_os = "emscripten")]
 pub mod emscripten;
+mod resources;
+mod shader;
+mod program;
+mod imgui_wrapper;
+mod texture;
+mod key_codes;
+mod mouse_buttons;
 
-pub fn main() {
-    let sdl_context = sdl2::init()
-        .expect("Failed to initialize SDL2");
+pub fn main() -> Result<()> {
     #[cfg(target_os = "emscripten")]
         let hint = unsafe { CStr::from_ptr(sdl2::sys::SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT.as_ptr() as *const _) }
         .to_str()
         .map(|hint| sdl2::hint::set(hint, "#canvas"))
         .expect("Failed to set emscripten keyboard element for SDL");
+    #[cfg(target_os = "emscripten")]
+    sdl2::hint::set("SDL_EMSCRIPTEN_ASYNCIFY", "1");
+    let sdl_context = sdl2::init()
+        .expect("Failed to initialize SDL2");
     let video_subsystem = sdl_context.video()
         .expect("Failed to initialize SDL video subsystem");
     let _gl_attr = {
@@ -35,127 +65,152 @@ pub fn main() {
     let mut event_pump = sdl_context.event_pump()
         .expect("Failed to retrieve event pump");
 
-    let mut vertex_buffer = initialize_vertices();
-    let mut program = load_program(
-        load_shader(load_string("assets/vertex.glsl"), gl::VERTEX_SHADER),
-        load_shader(load_string("assets/fragment.glsl"), gl::FRAGMENT_SHADER));
-    let mut vao = 0;
-    unsafe {
-        gl::GenVertexArrays(1, &mut vao);
+    let resource = resources::Resources::from_relative_exe_path(Path::new("assets"))?;
 
-        gl::EnableVertexAttribArray(0);
-        gl::EnableVertexAttribArray(1);
+    let vertex_buffer = initialize_vertices();
+    let vertex_shader = {
+        let src = resource.load_string("vertex.glsl")?;
+        Shader::from_source(src.as_str(), Kind::Vertex)?
+    };
+    let fragmnet_shader = {
+        let src = resource.load_string("fragment.glsl")?;
+        Shader::from_source(src.as_str(), Kind::Fragment)?
+    };
 
-        gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, (5 * std::mem::size_of::<f32>()) as gl::types::GLsizei, (0 * std::mem::size_of::<f32>()) as *const _);
-        gl::VertexAttribPointer(1, 3, gl::FLOAT, gl::FALSE, (5 * std::mem::size_of::<f32>()) as gl::types::GLsizei, (2 * std::mem::size_of::<f32>()) as *const _);
+    let program = Program::from_shaders(&[
+        &vertex_shader, &fragmnet_shader])?;
 
-        gl::UseProgram(program);
-    }
+    gl::viewport((0, 0), (500, 500));
+
+    let vao = gl::gen_vertex_array();
+    gl::bind_vertex_array(vao);
+    gl::bind_buffer(gl::ARRAY_BUFFER, vertex_buffer);
+    gl::enable_vertex_attrib_array(0);
+    gl::enable_vertex_attrib_array(1);
+
+    gl::vertex_attrib_pointer(0, gl::SIZE_2, gl::FLOAT, false, 5 * std::mem::size_of::<f32>(), 0);
+    gl::vertex_attrib_pointer(1, gl::SIZE_3, gl::FLOAT, false, 5 * std::mem::size_of::<f32>(), 2 * std::mem::size_of::<f32>());
+    gl::bind_vertex_array(gl::NO_VERTEX_ARRAY);
+
+    let mut imgui_context = imgui_wrapper::Imgui::init();
+
+    let mut mouse_buttons = MouseButtons::default();
+    let mut key_codes = KeyCodes::default();
+    let mut mouse_pos = (0, 0);
+    let mut chars: Vec<char> = Vec::new();
+    let mut gamma = 1f32;
 
     let mut main_loop = || {
         for event in event_pump.poll_iter() {
+            use sdl2::event::Event;
             match event {
-                sdl2::event::Event::Quit { .. } | sdl2::event::Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::Escape), .. } => std::process::exit(1),
-                sdl2::event::Event::KeyDown { keycode: Some(keycode), .. } => {
-                    println!("Key down: {:?}", keycode);
+                Event::MouseMotion { x, y, .. } => {
+                    mouse_pos = (
+                        // This is ok - Mouse coordinates shouldn't reach numbers which overflow 16bit
+                        i16::try_from(x).unwrap_or(0),
+                        i16::try_from(y).unwrap_or(0),
+                    );
                 }
+                Event::MouseButtonDown { mouse_btn, .. } => mouse_buttons[mouse_btn] = true,
+                Event::MouseButtonUp { mouse_btn, .. } => mouse_buttons[mouse_btn] = false,
+                Event::KeyDown {
+                    keycode: Some(keycode),
+                    ..
+                } => {
+                    key_codes[keycode] = true;
+
+                    let keycode = keycode as u32;
+                    if (32..512).contains(&keycode) {
+                        chars.push(char::from_u32(keycode).unwrap());
+                    }
+                }
+                Event::KeyUp {
+                    keycode: Some(keycode),
+                    ..
+                } => key_codes[keycode] = false,
+                Event::Quit { .. } => return false,
                 _ => {}
             }
+        }
 
-            unsafe {
-                gl::ClearColor(0f32, 0f32, 0f32, 1f32);
-                gl::Clear(gl::COLOR_BUFFER_BIT);
+        imgui_context.prepare(
+            [500f32, 500f32],
+            [mouse_pos.0.into(), mouse_pos.1.into()],
+            [
+                mouse_buttons[MouseButton::Left],
+                mouse_buttons[MouseButton::Right],
+            ],
+            &mut chars,
+        );
 
-                gl::DrawArrays(gl::TRIANGLES, 0, 3);
+        gl::clear_color(0xFF000000);
+        gl::clear(gl::COLOR);
+
+        gl::bind_vertex_array(vao);
+        program.set_used();
+
+        let uniform_location = gl::uniform_location(program.id(), "gamma");
+        gl::uniform(uniform_location, gamma);
+        gl::draw_arrays(gl::TRIANGLES, 0, 3);
+
+        imgui_context.render(|ui| {
+            ui.window("Settings")
+                .save_settings(false)
+                .always_auto_resize(true)
+                .build(|| {
+                    ui.slider("Gamma", 0.5f32, 2.5f32, &mut gamma);
+                    if ui.button("Reset (1.0)") {
+                        gamma = 1f32;
+                    }
+                    ui.same_line();
+                    if ui.button("Reset (2.2)") {
+                        gamma = 2.2f32;
+                    }
+                });
+        });
+
+        #[cfg(not(target_os = "emscripten"))]
+        window.gl_swap_window();
+
+        true
+    };
+
+    /*
+        #[cfg(target_os = "emscripten")]
+        {
+            use emscripten::emscripten;
+            emscripten::set_main_loop_callback(main_loop);
+            {
+                let _ = imgui_context;
             }
-
-            #[cfg(not(target_os = "emscripten"))]
-            window.gl_swap_window();
+            Ok(())
         }
-    };
+    */
 
-    #[cfg(target_os = "emscripten")]
-    {
-        use emscripten::emscripten;
-        emscripten::set_main_loop_callback(main_loop)
-    }
-
-    #[cfg(not(target_os = "emscripten"))]
     loop {
-        main_loop();
-    }
-}
-
-fn load_string(file_name: &str) -> std::ffi::CString {
-    let mut file = std::fs::File::open(file_name)
-        .unwrap();
-    let file_len = file.metadata().unwrap().len() as usize;
-    let mut buffer = Vec::with_capacity(file_len + 1);
-    file.read_to_end(&mut buffer).unwrap();
-    unsafe { std::ffi::CString::from_vec_unchecked(buffer) }
-}
-
-fn load_shader(source: std::ffi::CString, shader_type: gl::types::GLenum) -> gl::types::GLuint {
-    let shader = unsafe { gl::CreateShader(shader_type) };
-    unsafe {
-        gl::ShaderSource(shader, 1, &source.as_ptr(), std::ptr::null());
-        gl::CompileShader(shader);
-    }
-
-    let mut success: gl::types::GLint = 1;
-    unsafe {
-        gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut success);
-    }
-
-    if success == 0 {
-        let mut len: gl::types::GLint = 0;
-        unsafe {
-            gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut len);
+        if !main_loop() {
+            break;
         }
 
-        // GL_INFO_LOG_LENGTH contains a positive number or 0 if no information is available
-        let error_string_length = usize::try_from(len).unwrap_or(0);
-        let mut error_string = String::with_capacity(error_string_length);
-        error_string.extend([' '].iter().cycle().take(error_string_length));
-
-        unsafe {
-            gl::GetShaderInfoLog(
-                shader,
-                len,
-                std::ptr::null_mut(),
-                error_string.as_mut_ptr().cast());
-        }
-
-        println!("{}", error_string);
+        #[cfg(target_os = "emscripten")]
+        emscripten::emscripten::sleep(16);
     }
 
-    shader
+    Ok(())
 }
 
-fn load_program(vertex_shader: gl::types::GLuint, fragment_shader: gl::types::GLuint) -> gl::types::GLuint {
-    let program = unsafe { gl::CreateProgram() };
-    unsafe {
-        gl::AttachShader(program, vertex_shader);
-        gl::AttachShader(program, fragment_shader);
-        gl::LinkProgram(program);
-    }
-
-    program
-}
-
-fn initialize_vertices() -> gl::types::GLuint {
+fn initialize_vertices() -> gl::BufferId {
     let vertices = vec![
-        -0.5f32, -0.5f32, 1f32, 0f32, 0f32, 0.5f32, -0.5f32, 0f32, 1f32, 0f32, 0f32, 0.5f32, 0f32,
-        0f32, 1f32,
+        -0.5f32, -0.5f32,
+        1f32, 0f32, 0f32,
+        0.5f32, -0.5f32,
+        0f32, 1f32, 0f32,
+        0f32, 0.5f32,
+        0f32, 0f32, 1f32,
     ];
-
-    let size = std::mem::size_of::<f32>() * vertices.len();
-    let mut buffer = 0;
-    unsafe {
-        gl::GenBuffers(1, &mut buffer);
-        gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
-        gl::BufferData(gl::ARRAY_BUFFER, size as gl::types::GLsizeiptr, vertices.as_ptr().cast::<std::ffi::c_void>(), gl::STREAM_DRAW);
-    };
+    let buffer = gl::gen_buffer();
+    gl::bind_buffer(gl::ARRAY_BUFFER, buffer);
+    gl::buffer_data(gl::ARRAY_BUFFER, vertices.as_slice(), gl::STREAM_DRAW);
 
     buffer
 }

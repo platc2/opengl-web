@@ -1,0 +1,9 @@
+[package]
+name = "gl"
+version = '0.1.0'
+
+[dependencies]
+gl_raw_handle_derive = { path = '../gl_raw_handle_derive' }
+
+[build-dependencies]
+gl_generator = "0.14.0"
